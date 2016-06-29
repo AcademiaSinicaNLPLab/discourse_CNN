@@ -1,0 +1,6 @@
+[submodule "word2vec"]
+	path = word2vec
+	url = git@github.com:AcademiaSinicaNLPLab/word2vec_gensim
+[submodule "corpus"]
+	path = corpus
+	url = git@github.com:AcademiaSinicaNLPLab/sentiment_dataset
