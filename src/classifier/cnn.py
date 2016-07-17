@@ -8,7 +8,7 @@ import numpy as np
 from keras.models import Sequential, Model, model_from_json
 from keras.wrappers.scikit_learn import KerasClassifier
 from keras.layers.convolutional import Convolution1D, MaxPooling1D
-from keras.layers import Layer, Input, merge, Dense, Embedding, Dropout, Activation, Flatten, Reshape, Permute, Lambda, RepeatVector
+from keras.layers import Layer, Input, merge, Dense, Embedding, Dropout, Activation, Flatten, Reshape, Permute, Lambda, RepeatVector, GRU
 from keras.layers.wrappers import TimeDistributed
 from keras import initializations
 from keras import regularizers
@@ -120,19 +120,19 @@ class CNNS(KerasClassifier):
             params.update({'embedding_weights': 'random'})
         print params
 
-    def add_full(self, model, drop_out_prob, nb_class):
+    def add_full(self, model, drop_out_prob, nb_class, norm=9):
         ''' For keras Sequential api'''
         model.add(Dropout(drop_out_prob))
         assert(nb_class > 1)
-        model.add(Dense(nb_class, W_constraint=MaxNorm(m=9, axis=0)))
+        model.add(Dense(nb_class, W_constraint=MaxNorm(m=norm, axis=0)))
         model.add(Activation('softmax'))
 
-    def get_full(self, drop_out_prob, nb_class):
+    def get_full(self, drop_out_prob, nb_class, norm=9):
         ''' For keras functional api'''
         def pseudo_layer(layer):
             clf = Dropout(drop_out_prob)(layer)
             assert(nb_class > 1)
-            clf = Dense(nb_class, W_constraint=MaxNorm(m=9, axis=0))(clf)
+            clf = Dense(nb_class, W_constraint=MaxNorm(m=norm, axis=0))(clf)
             clf = Activation('softmax')(clf)
             return clf
         return pseudo_layer
@@ -154,7 +154,7 @@ class CNNS(KerasClassifier):
 
     def compile(self, model):
         model.compile(optimizer='adadelta', loss='categorical_crossentropy', metrics=['accuracy'])
-        model.summary()
+        # model.summary()
 
 class Kim_CNN(CNNS):
     def __call__(self,
@@ -165,13 +165,14 @@ class Kim_CNN(CNNS):
                  nb_filter=100,
                  filter_length=[3,4,5],
                  nb_class=2,
+                 maxnorm=9,
                  drop_out_prob=0.):
 
-        self.log_params(locals())
+        # self.log_params(locals())
         model = Sequential()
         model.add(self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights))
         model.add(self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length))
-        self.add_full(model, drop_out_prob, nb_class)
+        self.add_full(model, drop_out_prob, nb_class, norm=maxnorm)
         self.compile(model)
         return model
 
@@ -195,25 +196,25 @@ class Kim_CNN(CNNS):
         output = Flatten()(output)
         return Model(main_input, output)
 
-class Kim_CNN2(Kim_CNN):
+class RNN(CNNS):
     def __call__(self,
                  vocabulary_size=5000,
                  maxlen=100,
                  embedding_dim=300,
-                 embedding_weights=None,
                  nb_filter=100,
                  filter_length=[3,4,5],
                  nb_class=2,
-                 drop_out_prob=0.):
+                 drop_out_prob=0.,
+                 maxnorm=9,
+                 embedding_weights=None):
 
         self.log_params(locals())
         model = Sequential()
-        model.add(self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights))
-        # model.add(TimeDistributed(Scale(embedding_dim, weights=[np.ones(embedding_dim)], W_constraint='nonneg')))
-        model.add(TimeDistributed(Dense(10)))
-        model.add(self.conv_Layer(maxlen, 10, 10, filter_length))
-        self.add_full(model, drop_out_prob=0, nb_class=nb_class)
+        model.add(Embedding(vocabulary_size, embedding_dim, mask_zero=True, input_length=maxlen, weights=[embedding_weights]))
+        model.add(GRU(nb_filter))
+        self.add_full(model, drop_out_prob, nb_class)
         self.compile(model)
+        # model.summary()
         return model
 
 class ConjWeight_CNN(Kim_CNN):
@@ -225,6 +226,7 @@ class ConjWeight_CNN(Kim_CNN):
                  nb_filter=100,
                  filter_length=[3,4,5],
                  nb_class=2,
+                 maxnorm=9,
                  drop_out_prob=0.):
 
         self.log_params(locals())
@@ -237,7 +239,40 @@ class ConjWeight_CNN(Kim_CNN):
 
         weighted_emb = merge([emb, weight], mode='mul')
         conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(weighted_emb)
-        clf = self.get_full(drop_out_prob, nb_class)(conv)
+        clf = self.get_full(drop_out_prob, nb_class, norm=maxnorm)(conv)
+
+        model = Model([sent_input, weight_input], clf)
+        self.compile(model)
+        return model
+
+class ConjWeight_CNN2(Kim_CNN):
+    def __call__(self,
+                 weight_range,
+                 vocabulary_size=5000,
+                 maxlen=100,
+                 embedding_dim=300,
+                 embedding_weights=None,
+                 nb_filter=100,
+                 filter_length=[3,4,5],
+                 nb_class=2,
+                 maxnorm=9,
+                 drop_out_prob=0.):
+
+        self.log_params(locals())
+        min_weight, max_weight = int(weight_range[0]), int(weight_range[1])
+
+        sent_input = Input(shape=(maxlen,), dtype='int32')
+        emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
+
+        weight_input = Input((maxlen,), dtype='int32') 
+        shift_weight_input = Lambda(lambda x: x - min_weight)(weight_input)
+        weight_init = np.arange(min_weight, max_weight+1)[:, None]*np.ones(1)
+        weight = self.get_emb_layer(max_weight-min_weight+1, 1, maxlen, mask_index=-min_weight, embedding_weights=weight_init)(shift_weight_input)
+        weight = Lambda(lambda x:K.repeat_elements(x, embedding_dim, axis=2), output_shape=(maxlen, embedding_dim))(weight)
+
+        weighted_emb = merge([emb, weight], mode='mul')
+        conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(weighted_emb)
+        clf = self.get_full(drop_out_prob, nb_class, norm=maxnorm)(conv)
 
         model = Model([sent_input, weight_input], clf)
         self.compile(model)
@@ -258,39 +293,6 @@ class InTest(Layer):
         x = K.in_test_phase(x, M)
         return x
 
-class ConjWeight_CNN2(Kim_CNN):
-    def __call__(self,
-                 vocabulary_size=5000,
-                 maxlen=100,
-                 embedding_dim=300,
-                 embedding_weights=None,
-                 nb_filter=100,
-                 filter_length=[3,4,5],
-                 nb_class=2,
-                 drop_out_prob=0.):
-
-        self.log_params(locals())
-        sent_input = Input(shape=(maxlen,), dtype='int32')
-        emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
-
-        weight_input = Input((maxlen,)) 
-        weight = RepeatVector(embedding_dim)(weight_input)
-        weight = Permute((2,1))(weight)
-        weight = InTest(maxlen, embedding_dim)(weight)
-
-        flip_input = Input((maxlen,), dtype='int32')
-        flip_init = np.array([1, -1])[:, None]*np.ones(embedding_dim)
-        # flip_weight = self.get_emb_layer(2, embedding_dim, maxlen, flip_init, mask_fill=np.ones(embedding_dim))(flip_input)
-        flip_weight = Embedding(2, embedding_dim, input_length=maxlen, weights=[flip_init])(flip_input)
-
-        weighted_emb = merge([emb, weight, flip_weight], mode='mul')
-        conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(weighted_emb)
-        clf = self.get_full(drop_out_prob, nb_class)(conv)
-
-        model = Model([sent_input, weight_input, flip_input], clf)
-        self.compile(model)
-        return model
-
 class ConjWeightNegVec_CNN(Kim_CNN):
     def __call__(self,
                  vocabulary_size=5000,
@@ -300,6 +302,7 @@ class ConjWeightNegVec_CNN(Kim_CNN):
                  nb_filter=100,
                  filter_length=[3,4,5],
                  nb_class=2,
+                 maxnorm=9,
                  drop_out_prob=0.,
                  l1 = 0.,
                  l2 = 0.):
@@ -310,17 +313,15 @@ class ConjWeightNegVec_CNN(Kim_CNN):
         emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
 
         weight_input = Input((maxlen,)) 
-        weight = RepeatVector(embedding_dim)(weight_input)
-        weight = Permute((2,1))(weight)
+        weight = Lambda(lambda x:K.repeat_elements(K.expand_dims(x), embedding_dim, axis=2), output_shape=(maxlen, embedding_dim))(weight_input)
 
         flip_input = Input((maxlen,), dtype='int32')
         flip_init = -1*np.ones((2, embedding_dim))
-        # flip_weight = self.get_emb_layer(2, embedding_dim, maxlen, embedding_weights=flip_init, mask_fill=[1]*embedding_dim, W_regularizer=l1l2(l1,l2))(flip_input)
         flip_weight = self.get_emb_layer(2, embedding_dim, maxlen, embedding_weights=flip_init, mask_fill=[1]*embedding_dim)(flip_input)
 
         weighted_emb = merge([emb, weight, flip_weight], mode='mul')
         conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(weighted_emb)
-        clf = self.get_full(drop_out_prob, nb_class)(conv)
+        clf = self.get_full(drop_out_prob, nb_class, norm=maxnorm)(conv)
 
         model = Model([sent_input, weight_input, flip_input], clf)
         self.compile(model)
@@ -337,6 +338,7 @@ class ConjWeightAllVec_CNN(Kim_CNN):
                  filter_length=[3,4,5],
                  nb_class=2,
                  drop_out_prob=0.,
+                 maxnorm=9,
                  l1 = 0.,
                  l2 = 0.):
 
@@ -354,7 +356,7 @@ class ConjWeightAllVec_CNN(Kim_CNN):
 
         weighted_emb = merge([emb, weight], mode='mul')
         conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(weighted_emb)
-        clf = self.get_full(drop_out_prob, nb_class)(conv)
+        clf = self.get_full(drop_out_prob, nb_class, norm=maxnorm)(conv)
 
         model = Model([sent_input, weight_input], clf)
         self.compile(model)
@@ -367,49 +369,6 @@ def switch(xs):
         return tf.select(tf.python.math_ops.greater(condition, K.zeros_like(condition)), then_expression, else_expression)
     else:
         return K.switch(condition>0, then_expression, else_expression)
-
-class ConjWeightAllVec_CNN2(Kim_CNN):
-    def __call__(self,
-                 weight_range,
-                 vocabulary_size=5000,
-                 maxlen=100,
-                 embedding_dim=300,
-                 embedding_weights=None,
-                 nb_filter=100,
-                 filter_length=[3,4,5],
-                 nb_class=2,
-                 drop_out_prob=0.,
-                 l1 = 0.,
-                 l2 = 0.):
-
-        self.log_params(locals())
-
-        sent_input = Input(shape=(maxlen,), dtype='int32', name='sent_input')
-        # ori_emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
-        # ori_conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(ori_emb)
-        emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
-        ori_conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(emb)
-        ori_clf = self.get_full(drop_out_prob, nb_class)(ori_conv)
-
-        # emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
-
-        min_weight, max_weight = int(weight_range[0]), int(weight_range[1])
-        weight_input = Input((maxlen,), dtype='int32', name='weight_input') 
-        shift_weight_input = Lambda(lambda x: x - min_weight)(weight_input)
-        weight_init = np.arange(min_weight, max_weight+1)[:, None]*np.ones(embedding_dim)
-        weight = self.get_emb_layer(max_weight-min_weight+1, embedding_dim, maxlen, mask_index=-min_weight, embedding_weights=weight_init)(shift_weight_input)
-
-        weighted_emb = merge([emb, weight], mode='mul')
-        conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(weighted_emb)
-        clf = self.get_full(drop_out_prob, nb_class)(conv)
-
-        indicator_input = Input(shape=(1,), dtype='int32', name='indicator')
-        indicator = Lambda(lambda x:K.repeat_elements(x, nb_class, axis=1), output_shape=(nb_class,))(indicator_input)
-        final_clf = merge([indicator, clf, ori_clf], mode=switch, output_shape=(None, nb_class))
-
-        model = Model([indicator_input, sent_input, weight_input], final_clf)
-        self.compile(model)
-        return model
 
 class Scale(Layer):
     def __init__(self, input_dim, init='glorot_uniform', activation='linear', weights=None,
@@ -475,6 +434,7 @@ class ConjWeightOneVec_CNN(Kim_CNN):
                  nb_filter=100,
                  filter_length=[3,4,5],
                  nb_class=2,
+                 maxnorm=9,
                  drop_out_prob=0.,
                  l1 = 0.,
                  l2 = 0.):
@@ -483,15 +443,16 @@ class ConjWeightOneVec_CNN(Kim_CNN):
 
         sent_input = Input(shape=(maxlen,), dtype='int32')
         emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
-        scaled_emb = TimeDistributed(Scale(embedding_dim, weights=[np.ones(embedding_dim)], W_regularizer=l1l2(l1,l2)))(emb)
+        # scaled_emb = TimeDistributed(Scale(embedding_dim, weights=[np.ones(embedding_dim)], W_regularizer=l1l2(l1,l2)))(emb)
+        # scaled_emb = TimeDistributed(Scale(embedding_dim, weights=[np.ones(embedding_dim)], W_regularizer=l1l2(0,0.03)))(emb)
+        scaled_emb = TimeDistributed(Scale(embedding_dim, weights=[np.ones(embedding_dim)], W_constraint='nonneg'))(emb)
 
         weight_input = Input((maxlen,)) 
-        weight = RepeatVector(embedding_dim)(weight_input)
-        weight = Permute((2,1))(weight)
+        weight = Lambda(lambda x:K.repeat_elements(K.expand_dims(x), embedding_dim, axis=2), output_shape=(maxlen, embedding_dim))(weight_input)
 
         weighted_emb = merge([scaled_emb, weight], mode='mul')
         conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(weighted_emb)
-        clf = self.get_full(drop_out_prob, nb_class)(conv)
+        clf = self.get_full(drop_out_prob, nb_class, norm=maxnorm)(conv)
 
         model = Model([sent_input, weight_input], clf)
         self.compile(model)
@@ -507,6 +468,7 @@ class ConjWeightTwoVec_CNN(Kim_CNN):
                  nb_filter=100,
                  filter_length=[3,4,5],
                  nb_class=2,
+                 maxnorm=9,
                  drop_out_prob=0.,
                  l1 = 0.,
                  l2 = 0.):
@@ -519,24 +481,16 @@ class ConjWeightTwoVec_CNN(Kim_CNN):
         sent_input = Input(shape=(maxlen,), dtype='int32')
         emb = self.get_emb_layer(vocabulary_size, embedding_dim, maxlen, embedding_weights)(sent_input)
 
-        # weight_input = Input((maxlen,)) 
-        # weight = self.get_emb_layer(3, 1, maxlen, np.array([0, 1, 2][:, None]))(weight_input)
-        # weight = RepeatVector(embedding_dim)(weight_input)
-        # weight = Permute((2,1))(weight)
-        weight_input = Input((maxlen,), dtype='int32') 
-        weight_init = np.arange(max_weight+1)[:, None]
-        weight = self.get_emb_layer(max_weight+1, 1, maxlen, mask_index=-min_weight, embedding_weights=weight_init)(weight_input)
-        weight = Lambda(lambda x:K.repeat_elements(x, embedding_dim, axis=2), output_shape=(maxlen, embedding_dim))(weight)
+        weight_input = Input((maxlen,)) 
+        weight = Lambda(lambda x:K.repeat_elements(K.expand_dims(x), embedding_dim, axis=2), output_shape=(maxlen, embedding_dim))(weight_input)
 
         flip_input = Input((maxlen,), dtype='int32')
         flip_init = np.array([1, -1])[:, None]*np.ones(embedding_dim)
-        # flip_weight = Embedding(2, embedding_dim, input_length=maxlen, weights=[flip_init], W_constraint=MaxNorm(2, axis=1))(flip_input)
-        # flip_weight = Embedding(2, embedding_dim, input_length=maxlen, weights=[flip_init], W_regularizer=l1l2(l2=0.01))(flip_input)
-        flip_weight = Embedding(2, embedding_dim, input_length=maxlen, weights=[flip_init], W_constraint=MaxNorm(2, axis=1))(flip_input)
+        flip_weight = Embedding(2, embedding_dim, input_length=maxlen, weights=[flip_init], W_constraint='nonneg')(flip_input)
 
         total_emb = merge([emb, weight, flip_weight], mode='mul')
         conv = self.conv_Layer(maxlen, embedding_dim, nb_filter, filter_length)(total_emb)
-        clf = self.get_full(drop_out_prob, nb_class)(conv)
+        clf = self.get_full(drop_out_prob, nb_class, norm=maxnorm)(conv)
 
         model = Model([sent_input, weight_input, flip_input], clf)
         self.compile(model)

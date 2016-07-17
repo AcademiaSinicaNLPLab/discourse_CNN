@@ -1,13 +1,13 @@
 import itertools
 import numpy as np
 from collections import Counter
-from word2vec.globvemongo import Globve
-from word2vec.word2vec import Word2Vec
 import copy
 from preprocessor import preprocess
 from functools import reduce
 import sys
-
+import os
+import cPickle
+from word2vec.word2vec import Word2Vec
 
 def feature_fuse(feature_extractors, sentences, labels=None):
     '''
@@ -80,32 +80,36 @@ class FeatureExtractor(object):
         '''
         raise NotImplementedError
 
+import sys 
 class W2VExtractor(FeatureExtractor):
-    def __init__(self, use_globve=False):
-        self.use_globve = use_globve
-        if self.use_globve:
-            self.model = Globve()  # wordvector model
-        else:
-            self.model = Word2Vec()  # wordvector model
 
-    def pre_dump(self):
-        # It's silly to pickle the whole word embedding.
-        del self.model
-
-    def post_load(self):
-        # Load the word embedding bacause we didn't store it when dumping.
-        if self.use_globve:
-            self.model = Globve()  # wordvector model
+    def __init__(self, cache_file_name=None):
+        if cache_file_name is not None and os.path.isfile(cache_file_name):
+            with open(cache_file_name) as f:
+                self.model = cPickle.load(f)
+            self.write_to_cache = False
         else:
-            self.model = Word2Vec()  # wordvector model
+            self.model = Word2Vec()
+            self.cache_file_name = cache_file_name
+            self.cache_model = {}
+            self.write_to_cache = True
+
+    def extract_train(self, sentences, labels):
+        res = super(W2VExtractor, self).extract_train(sentences, labels)
+        if self.write_to_cache:
+            with open(self.cache_file_name, 'w') as f:
+                cPickle.dump(self.cache_model, f)
+        return res
 
     def _extract(self, wordarray):
         X = np.zeros(300)
         i = 0
-        for word in [w.decode('utf8') for w in wordarray]:
+        for word in [w for w in wordarray]:
             if word in self.model:
                 i += 1
-                X = X + self.model[word]
+                X = X + np.asarray(self.model[word])
+                if self.write_to_cache:
+                    self.cache_model[word] = list(self.model[word])
         if i > 0:
             X = X / i
         return X
@@ -168,22 +172,31 @@ class ConjChecker(object):
 class ConjWeightCNNExtractor(CNNExtractor):
     def __init__(self, **kwargs):
         super(ConjWeightCNNExtractor, self).__init__(**kwargs)
-        conj_fol = [(w,) for w in ['but', 'however', 'nevertheless', 'otherwise', 'yet', 'still', 'nonetheless']]
-        conj_infer = [(w,) for w in ['therefore', 'furthermore', 'consequently', 'thus', 'subsequently', 'eventually', 'hence']]
-        self.conj_fol = conj_fol+conj_infer
+        self.conj_fol = [(w,) for w in ['but', 'however', 'nevertheless', 'otherwise', 'yet', 'still', 'nonetheless']]
+        self.conj_infer = [(w,) for w in ['therefore', 'furthermore', 'consequently', 'thus', 'subsequently', 'eventually', 'hence']]
         self.conj_prev = [(w,) for w in ['till', 'until', 'despite', 'though', 'although', 'unless']]+[('even', 'if')]
         self.conj_prev_head = [(w,) for w in ['while']]
 
         self.mod = [(w,) for w in ['if', 'might', 'could', 'can', 'would', 'may']]
         self.neg = [(w,) for w in ['n\'t', 'not', 'neither', 'never', 'no', 'nor']]
-        # self.no_emotion = set(['.']+stopwords.words('english'))
         self.neg_win = 5
 
-        self.conj = self.conj_fol+self.conj_prev
+        self.conj = self.conj_fol+self.conj_infer+self.conj_prev
         self.All = self.conj+self.neg
 
         self.min_weight = 0
         self.max_weight = 0
+
+        self.use={
+            'conj_prev_head':True,
+            'mod':False,
+            'conj_fol':True,
+            'conj_infer':True,
+            'conj_prev_patch':True,
+            'conj_prev':True,
+            'neg':True,
+        }
+        print self.use
 
     def extract_weight(self, wordarray):
         len_words = len(wordarray)
@@ -194,6 +207,7 @@ class ConjWeightCNNExtractor(CNNExtractor):
         weight[:len_words] = 1
         flip = np.zeros(len(wordarray))
         flip[:len_words] = 1
+        mod = 0
 
         periods = [-1] + list(np.where(wordarray=='.')[0]) + [len_words]
         for b, end in zip(periods[:-1], periods[1:]):
@@ -201,7 +215,7 @@ class ConjWeightCNNExtractor(CNNExtractor):
             sentence = wordarray[beg:end]
             isIn = ConjChecker()
             for i in range(len(sentence)):
-                if i==1 and isIn(sentence, i, self.conj_prev_head):
+                if self.use['conj_prev_head'] and i==1 and isIn(sentence, i, self.conj_prev_head):
                     for j in range(i+isIn.res, len(sentence)):
                         if sentence[j] ==',':
                             for k in range(j+1, len(sentence)):
@@ -210,36 +224,46 @@ class ConjWeightCNNExtractor(CNNExtractor):
                                 else:
                                     weight[beg+k]+=1
                             break
-                if isIn(sentence, i, self.conj_fol):
+                elif self.use['mod'] and isIn(sentence, i, self.mod):
+                    mod=1
+                elif self.use['conj_fol'] and isIn(sentence, i, self.conj_fol):
+                    for j in range(i+isIn.res, len(sentence)):
+                        if isIn(sentence, j, self.conj):
+                            break
+                        else:
+                            weight[beg+j]+=1
+                elif self.use['conj_infer'] and isIn(sentence, i, self.conj_infer):
                     for j in range(i+isIn.res, len(sentence)):
                         if isIn(sentence, j, self.conj):
                             break
                         else:
                             weight[beg+j]+=1
                 elif isIn(sentence, i, self.conj_prev):
-                    for j in range(i-1, 0, -1):
-                        if isIn(sentence, j, self.conj):
-                            break
-                        else:
-                            weight[beg+j]+=1
-                    for j in range(i+isIn.res, len(sentence)):
-                        if sentence[j] ==',':
-                            for k in range(j+1, len(sentence)):
-                                if isIn(sentence, k, self.conj):
-                                    break
-                                else:
-                                    weight[beg+k]+=1
-                            break
-                elif isIn(sentence, i, self.neg):
+                    if self.use['conj_prev_patch']:
+                        for j in range(i+isIn.res, len(sentence)):
+                            if sentence[j] ==',':
+                                for k in range(j+1, len(sentence)):
+                                    if isIn(sentence, k, self.conj):
+                                        break
+                                    else:
+                                        weight[beg+k]+=1
+                                break
+                    if self.use['conj_prev']:
+                        for j in range(i-1, 0, -1):
+                            if isIn(sentence, j, self.conj):
+                                break
+                            else:
+                                weight[beg+j]+=1
+                elif self.use['neg'] and isIn(sentence, i, self.neg):
                     for j in range(i+isIn.res, min(i+1+self.neg_win, len(sentence))):
                         if isIn(sentence, j, self.All):
                             break
                         else:
                             flip[beg+j]=-1
-                # if word in self.All:
-                #     weight[beg+i] -= 1
 
         res = weight*flip
+        if self.use['mod'] and mod == 0:
+            res = 2*res
         self.min_weight = min(self.min_weight, min(res))
         self.max_weight = max(self.max_weight, max(res))
         return res
@@ -265,7 +289,7 @@ ConjWeightNegVecCNNExtractor = ConjWeightFlipCNNExtractor
 ConjWeightOneVecCNNExtractor = ConjWeightCNNExtractor
 ConjWeightTwoVecCNNExtractor = ConjWeightFlipCNNExtractor
 ConjWeightAllVecCNNExtractor = ConjWeightCNNExtractor
-ConjWeightCNNExtractor2 = ConjWeightFlipCNNExtractor
+ConjWeightCNNExtractor2 = ConjWeightCNNExtractor
 
 class ConjWeightAllVecCNNExtractor2(ConjWeightCNNExtractor):
 

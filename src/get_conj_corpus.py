@@ -5,10 +5,10 @@ import sys
 import pandas
 import argparse
 import os
-from feature.extractor import feature_fuse, W2VExtractor, CNNExtractor
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 CORPUS_DIR = os.path.join(MODULE_DIR, '..', 'corpus')
+CONJCORPUS_DIR = os.path.join(MODULE_DIR, '..', 'conjcorpus')
 
 def parse_arg(argv):
     parser = argparse.ArgumentParser(description='')
@@ -51,10 +51,13 @@ def get_conj_ind(sentences, inv=False):
     for i, sentence in enumerate(sentences):
         isin = False 
         wordarray = sentence.split()
-        for j in range(len(wordarray)):
-            if isIn(wordarray, j, All):
-                isin = True
-                break
+        if len(wordarray)>0 and wordarray[0] in conj_prev_head:
+            isIn = True
+        else:
+            for j in range(len(wordarray)):
+                if isIn(wordarray, j, All):
+                    isin = True
+                    break
         if isin:
             res.append(i)
         else:
@@ -69,12 +72,13 @@ if __name__ == "__main__":
     args = parse_arg(sys.argv)
     dataset = args.dataset
     corpus = pandas.read_pickle(os.path.join(CORPUS_DIR, dataset+'.pkl'))
+    corpus['split'] = 'train'
     conj_ind = get_conj_ind(corpus.sentence)
 
-    corpus.loc[conj_ind].to_csv(os.path.join(CORPUS_DIR, 'data', 'CONJ'+dataset+'.all'), index=False, doublequote=False, sep=' ', header=False, columns=['label','sentence'])
-    corpus.loc[conj_ind].to_pickle(os.path.join(CORPUS_DIR, 'CONJ'+dataset+'.pkl'))
+    corpus.loc[conj_ind].to_csv(os.path.join(CONJCORPUS_DIR, 'data', 'CONJ'+dataset+'.all'), index=False, doublequote=False, sep=' ', header=False, columns=['label','sentence'])
+    corpus.loc[conj_ind].to_pickle(os.path.join(CONJCORPUS_DIR, 'CONJ'+dataset+'.pkl'))
 
     inv_conj_ind = get_conj_ind(corpus.sentence, inv=True)
 
-    corpus.loc[inv_conj_ind].to_csv(os.path.join(CORPUS_DIR, 'data', 'INVCONJ'+dataset+'.all'), index=False, doublequote=False, sep=' ', header=False, columns=['label','sentence'])
-    corpus.loc[inv_conj_ind].to_pickle(os.path.join(CORPUS_DIR, 'INVCONJ'+dataset+'.pkl'))
+    corpus.loc[inv_conj_ind].to_csv(os.path.join(CONJCORPUS_DIR, 'data', 'INVCONJ'+dataset+'.all'), index=False, doublequote=False, sep=' ', header=False, columns=['label','sentence'])
+    corpus.loc[inv_conj_ind].to_pickle(os.path.join(CONJCORPUS_DIR, 'INVCONJ'+dataset+'.pkl'))
